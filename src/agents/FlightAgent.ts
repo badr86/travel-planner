@@ -3,8 +3,8 @@ import { BaseAgent } from "./BaseAgent";
 import { AgentResponse, TravelPlanRequest, FlightSegment, FlightOption, FlightSearchResults } from "./types";
 
 export class FlightAgent extends BaseAgent {
-  private readonly flightApiKey: string;
-  private readonly flightApiUrl = 'https://api.amadeus.com/v2'; // Amadeus API example
+  private readonly serpApiKey: string;
+  private readonly serpApiUrl = 'https://serpapi.com/search';
 
   constructor() {
     const prompt = PromptTemplate.fromTemplate(`
@@ -26,14 +26,14 @@ export class FlightAgent extends BaseAgent {
     `);
 
     super("gpt-4", 0.7, prompt);
-    this.flightApiKey = process.env.AMADEUS_API_KEY || process.env.FLIGHT_API_KEY || '';
+    this.serpApiKey = process.env.SERP_API_KEY || '';
     this.initialize();
   }
 
   async process(request: TravelPlanRequest): Promise<AgentResponse> {
     try {
-      if (!this.flightApiKey) {
-        console.warn('Flight API key not configured, using mock flight data');
+      if (!this.serpApiKey) {
+        console.warn('SERP API key not configured, using mock flight data');
         return this.getMockFlightData(request);
       }
 
@@ -85,7 +85,9 @@ export class FlightAgent extends BaseAgent {
       const destinationCode = await this.getAirportCode(destination);
       
       if (!originCode || !destinationCode) {
-        throw new Error(`Could not find airport codes for ${origin} or ${destination}`);
+        console.warn(`Could not find airport codes for ${origin} or ${destination}, using mock data`);
+        // Fall back to mock data if airport codes are not found
+        throw new Error('Airport codes not found');
       }
 
       // Search for flights using the API
@@ -100,6 +102,12 @@ export class FlightAgent extends BaseAgent {
 
       const flights = await this.callFlightAPI(searchParams);
       
+      // If SERP API returns no flights, fall back to mock data
+      if (!flights || flights.length === 0) {
+        console.warn('SERP API returned no flights, falling back to mock data');
+        throw new Error('No flights found from SERP API');
+      }
+      
       return {
         origin: origin,
         destination: destination,
@@ -107,12 +115,13 @@ export class FlightAgent extends BaseAgent {
         returnDate: request.endDate.toISOString().split('T')[0],
         passengers: 1,
         flights: flights,
-        searchSummary: '',
+        searchSummary: `Found ${flights.length} flight options from SERP API`,
         recommendations: [],
         lastUpdated: new Date().toISOString(),
       };
     } catch (error) {
       console.error('Error searching flights:', error);
+      // Fall back to mock data when SERP API fails
       throw error;
     }
   }
@@ -147,21 +156,135 @@ export class FlightAgent extends BaseAgent {
   }
 
   private async callFlightAPI(params: any): Promise<FlightOption[]> {
-    // This is where you'd integrate with a real flight API like Amadeus, Skyscanner, etc.
-    // For now, we'll simulate the API call
+    try {
+      // Build search parameters for SERP API (Google Flights)
+      const searchParams = new URLSearchParams({
+        engine: 'google_flights',
+        api_key: this.serpApiKey,
+        departure_id: params.origin,
+        arrival_id: params.destination,
+        outbound_date: params.departureDate,
+        return_date: params.returnDate,
+        currency: 'USD',
+        adults: params.adults?.toString() || '1',
+        type: '1' // Round trip
+      });
+      
+      // Add travel class if specified (SERP API uses different format)
+      const travelClass = params.class?.toLowerCase() || 'economy';
+      if (travelClass === 'economy') {
+        searchParams.append('travel_class', '1');
+      } else if (travelClass === 'premium_economy') {
+        searchParams.append('travel_class', '2');
+      } else if (travelClass === 'business') {
+        searchParams.append('travel_class', '3');
+      } else if (travelClass === 'first') {
+        searchParams.append('travel_class', '4');
+      } else {
+        searchParams.append('travel_class', '1'); // Default to economy
+      }
+
+      console.log('SERP API Request Parameters:', {
+        engine: 'google_flights',
+        departure_id: params.origin,
+        arrival_id: params.destination,
+        outbound_date: params.departureDate,
+        return_date: params.returnDate,
+        currency: 'USD',
+        adults: params.adults?.toString() || '1',
+        travel_class: travelClass === 'economy' ? '1' : travelClass === 'premium_economy' ? '2' : travelClass === 'business' ? '3' : travelClass === 'first' ? '4' : '1',
+        type: '1'
+      });
+      
+      console.log('Full SERP API URL:', `${this.serpApiUrl}?${searchParams}`);
+
+      const response = await fetch(`${this.serpApiUrl}?${searchParams}`, {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('SERP API Error Response:', errorText);
+        throw new Error(`SERP API request failed: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      
+      if (data.error) {
+        console.error('SERP API returned error:', data.error);
+        throw new Error(`SERP API error: ${data.error}`);
+      }
+
+      return this.parseSerpFlightResponse(data);
+    } catch (error) {
+      console.error('SERP API call failed:', error);
+      // Instead of throwing, let's fall back to mock data gracefully
+      return [];
+    }
+  }
+
+  private parseSerpFlightResponse(data: any): FlightOption[] {
+    const flights: FlightOption[] = [];
     
-    // In a real implementation:
-    // const response = await fetch(`${this.flightApiUrl}/shopping/flight-offers`, {
-    //   method: 'POST',
-    //   headers: {
-    //     'Authorization': `Bearer ${this.flightApiKey}`,
-    //     'Content-Type': 'application/json'
-    //   },
-    //   body: JSON.stringify(params)
-    // });
-    
-    // For demo purposes, return mock data
-    throw new Error('Flight API not implemented - using mock data');
+    if (!data.best_flights && !data.other_flights) {
+      return flights;
+    }
+
+    // Parse best flights
+    const bestFlights = data.best_flights || [];
+    const otherFlights = data.other_flights || [];
+    const allFlights = [...bestFlights, ...otherFlights];
+
+    allFlights.forEach((flight: any, index: number) => {
+      try {
+        const flightOption: FlightOption = {
+          id: `serp_flight_${index}`,
+          price: {
+            amount: flight.price || 0,
+            currency: 'USD'
+          },
+          outbound: this.parseFlightSegments(flight.flights || []),
+          return: flight.return_flights ? this.parseFlightSegments(flight.return_flights) : [],
+          totalDuration: flight.total_duration || 'N/A',
+          stops: flight.layovers?.length || 0,
+          class: flight.travel_class || 'economy',
+          airline: flight.airline || 'Unknown',
+          baggage: {
+            carry_on: true,
+            checked: flight.baggage || 'Check with airline'
+          }
+        };
+        flights.push(flightOption);
+      } catch (error) {
+        console.warn(`Failed to parse flight ${index}:`, error);
+      }
+    });
+
+    return flights.slice(0, 10); // Return top 10 flights
+  }
+
+  private parseFlightSegments(segments: any[]): FlightSegment[] {
+    return segments.map((segment: any) => ({
+      departure: {
+        airport: segment.departure_airport?.id || 'N/A',
+        city: segment.departure_airport?.name || 'N/A',
+        time: segment.departure_airport?.time || 'N/A',
+        date: segment.departure_airport?.date || 'N/A'
+      },
+      arrival: {
+        airport: segment.arrival_airport?.id || 'N/A',
+        city: segment.arrival_airport?.name || 'N/A',
+        time: segment.arrival_airport?.time || 'N/A',
+        date: segment.arrival_airport?.date || 'N/A'
+      },
+      airline: segment.airline || 'Unknown',
+      flightNumber: segment.flight_number || 'N/A',
+      duration: segment.duration || 'N/A',
+      aircraft: segment.airplane || 'N/A'
+    }));
   }
 
   private getMockFlightData(request: TravelPlanRequest): Promise<AgentResponse> {
