@@ -5,18 +5,76 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Attach to Chrome",
-            "port": 3000,
-            "request": "attach",
-            "type": "chrome",
-            "webRoot": "${workspaceFolder}"
-        },
-        {
+            "name": "Debug Travel Planner (Chrome)",
             "type": "chrome",
             "request": "launch",
-            "name": "Launch Chrome against localhost",
             "url": "http://localhost:3000",
-            "webRoot": "${workspaceFolder}"
+            "webRoot": "${workspaceFolder}",
+            "sourceMaps": true,
+            "sourceMapPathOverrides": {
+                "webpack:///./*": "${webRoot}/*",
+                "webpack:///src/*": "${webRoot}/src/*",
+                "webpack:///*": "*",
+                "webpack:///./~/*": "${webRoot}/node_modules/*"
+            },
+            "skipFiles": [
+                "${workspaceFolder}/node_modules/**/*.js",
+                "${workspaceFolder}/.next/**/*.js",
+                "<node_internals>/**/*.js"
+            ],
+            "userDataDir": "${workspaceFolder}/.vscode/chrome-debug-profile",
+            "runtimeArgs": [
+                "--remote-debugging-port=9222",
+                "--disable-web-security",
+                "--disable-features=VizDisplayCompositor"
+            ]
+        },
+        {
+            "name": "Attach to Chrome (Travel Planner)",
+            "type": "chrome",
+            "request": "attach",
+            "port": 9222,
+            "webRoot": "${workspaceFolder}",
+            "sourceMaps": true,
+            "urlFilter": "http://localhost:3000/*"
+        },
+        {
+            "name": "Next.js: debug server-side",
+            "type": "node",
+            "request": "attach",
+            "port": 9229,
+            "restart": true
+        },
+        {
+            "name": "Next.js: debug client-side",
+            "type": "chrome",
+            "request": "launch",
+            "url": "http://localhost:3000",
+            "webRoot": "${workspaceFolder}",
+            "sourceMaps": true,
+            "sourceMapPathOverrides": {
+                "webpack:///./*": "${webRoot}/*",
+                "webpack:///src/*": "${webRoot}/src/*",
+                "webpack:///*": "*",
+                "webpack:///./~/*": "${webRoot}/node_modules/*"
+            },
+            "skipFiles": [
+                "${workspaceFolder}/node_modules/**/*.js",
+                "${workspaceFolder}/.next/**/*.js",
+                "<node_internals>/**/*.js"
+            ]
+        },
+        {
+            "name": "Next.js: debug server (Windows)",
+            "type": "node",
+            "request": "launch",
+            "program": "${workspaceFolder}/node_modules/next/dist/bin/next",
+            "args": ["dev"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "restart": true,
+            "sourceMaps": true,
+            "runtimeArgs": ["--inspect=9229"]
         }
     ]
 }

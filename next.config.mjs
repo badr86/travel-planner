@@ -1,13 +1,14 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  productionBrowserSourceMaps: false,
+  // Enable source maps for debugging
+  productionBrowserSourceMaps: true,
   webpack: (config, { dev }) => {
-    // Disable source maps in development
+    // Enable source maps in development for debugging
     if (dev) {
-      config.devtool = false;
+      config.devtool = 'eval-source-map';
     }
     return config;
   }
 };
 
-export default nextConfig; 
+export default nextConfig;

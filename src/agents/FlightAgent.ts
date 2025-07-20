@@ -1,63 +1,101 @@
-import { PromptTemplate } from "@langchain/core/prompts";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { AgentExecutor } from "langchain/agents";
+import { createOpenAIToolsAgent } from "langchain/agents";
 import { BaseAgent } from "./BaseAgent";
-import { AgentResponse, TravelPlanRequest, FlightSegment, FlightOption, FlightSearchResults } from "./types";
+import { AgentResponse, TravelPlanRequest, FlightSearchResults, FlightOption, FlightSegment } from "./types";
+import { FlightSearchTool, AirportCodeLookupTool } from "./tools";
 
 export class FlightAgent extends BaseAgent {
-  private readonly serpApiKey: string;
-  private readonly serpApiUrl = 'https://serpapi.com/search';
+  private agentExecutor!: AgentExecutor;
+  private tools!: any[];
 
   constructor() {
-    const prompt = PromptTemplate.fromTemplate(`
-      You are a flight search expert providing travel advice based on flight options.
+    const prompt = ChatPromptTemplate.fromMessages([
+      ["system", `You are a flight search expert helping travelers find and compare flight options.
       
-      Origin: {origin}
-      Destination: {destination}
-      Departure Date: {departureDate}
-      Return Date: {returnDate}
-      Flight Options: {flightData}
+      IMPORTANT: You MUST use the available tools to help users. Never provide flight information without using the tools first.
       
-      Based on the flight search results, provide:
-      1. A brief summary of available flight options
-      2. Recommendations for the best value flights
-      3. Tips for booking and travel
-      4. Advice on timing and alternatives
+      Available tools:
+      - airport_code_lookup: Look up airport codes for cities (REQUIRED for all flight searches)
+      - flight_search: Search for flights between airports (REQUIRED after getting airport codes)
       
-      Format your response as practical flight booking advice for travelers.
-    `);
+      MANDATORY WORKFLOW for ALL flight requests:
+      1. ALWAYS use airport_code_lookup to get airport codes for both origin and destination cities
+      2. ALWAYS use flight_search with the airport codes to find actual flights
+      3. Only after using both tools, provide analysis and recommendations
+      
+      Do NOT provide flight information without using these tools first. Always start by looking up airport codes.`],
+      ["human", "{input}"],
+      ["assistant", "{agent_scratchpad}"]
+    ]);
 
-    super("gpt-4", 0.7, prompt);
-    this.serpApiKey = process.env.SERP_API_KEY || '';
-    this.initialize();
+    super("gpt-4", 0.7);
+    this.prompt = prompt;
+    this.initializeAgent();
+  }
+
+  private async initializeAgent() {
+    try {
+      // Initialize tools
+      this.tools = [
+        new AirportCodeLookupTool(),
+        new FlightSearchTool()
+      ];
+
+      // Create the agent
+      const agent = await createOpenAIToolsAgent({
+        llm: this.model,
+        tools: this.tools,
+        prompt: this.prompt as any
+      });
+
+      // Create agent executor
+      this.agentExecutor = new AgentExecutor({
+        agent,
+        tools: this.tools,
+        verbose: true,
+        maxIterations: 5,
+        returnIntermediateSteps: true
+      });
+
+    } catch (error) {
+      console.error('Error initializing FlightAgent:', error);
+      throw error;
+    }
   }
 
   async process(request: TravelPlanRequest): Promise<AgentResponse> {
     try {
-      if (!this.serpApiKey) {
-        console.warn('SERP API key not configured, using mock flight data');
-        return this.getMockFlightData(request);
-      }
-
       if (!this.validateDates(request.startDate, request.endDate)) {
         throw new Error("Invalid dates provided");
       }
 
-      // Search for flights
-      const flightResults = await this.searchFlights(request);
-      
-      // Generate AI recommendations based on flight options
-      const aiResponse = await this.chain.invoke({
-        origin: this.extractOriginCity(request),
-        destination: request.destination,
-        departureDate: request.startDate.toISOString(),
-        returnDate: request.endDate.toISOString(),
-        flightData: JSON.stringify(flightResults.flights.slice(0, 3)), // Top 3 options
+      const origin = this.extractOriginCity(request);
+      const destination = request.destination;
+      const departureDate = request.startDate.toISOString().split('T')[0];
+      const returnDate = request.endDate.toISOString().split('T')[0];
+
+      // Create input for the agent
+      const input = `Find flights from ${origin} to ${destination}. Departure date: ${departureDate}, Return date: ${returnDate}. Please search for flights and provide recommendations including pricing, duration, and booking tips.`;
+
+      // Use the agent executor to process the request
+      const agentResponse = await this.agentExecutor.invoke({
+        input: input
       });
 
-      const flightInfo: FlightSearchResults = {
-        ...flightResults,
-        searchSummary: this.extractSummary(aiResponse),
-        recommendations: this.extractRecommendations(aiResponse),
-      };
+      //console.log('Agent Response:', JSON.stringify(agentResponse, null, 2));
+
+      // Parse the agent's response to extract structured flight data
+      const flightInfo = await this.parseAgentResponse(
+        agentResponse.output, 
+        agentResponse.intermediateSteps || [],
+        {
+          origin,
+          destination,
+          departureDate,
+          returnDate
+        }
+      );
 
       return {
         success: true,
@@ -65,7 +103,82 @@ export class FlightAgent extends BaseAgent {
       };
     } catch (error) {
       console.error('Flight Agent Error:', error);
-      return this.handleError(error);
+      // Fallback to mock data on error
+      return this.getMockFlightData(request);
+    }
+  }
+
+  private async parseAgentResponse(
+    agentOutput: string, 
+    intermediateSteps: any[], 
+    searchParams: any
+  ): Promise<FlightSearchResults> {
+    try {
+      //console.log('Parsing agent response:', agentOutput);
+      //console.log('Intermediate steps:', JSON.stringify(intermediateSteps, null, 2));
+      
+      let flights: any[] = [];
+      let airportCodes: any = {};
+      
+      // Extract results from intermediate steps
+      for (const step of intermediateSteps) {
+        const toolName = step.action?.tool;
+        const toolResult = step.observation;
+        
+        if (toolName === 'airport_code_lookup') {
+          try {
+            const parsedResult = JSON.parse(toolResult);
+            if (parsedResult.success) {
+              airportCodes[parsedResult.city] = parsedResult.airportCode;
+            }
+          } catch (e) {
+            console.warn('Failed to parse airport code result:', e);
+          }
+        } else if (toolName === 'flight_search') {
+          try {
+            const parsedResult = JSON.parse(toolResult);
+            if (parsedResult.flights) {
+              flights = parsedResult.flights;
+            }
+          } catch (e) {
+            console.warn('Failed to parse flight search result:', e);
+          }
+        }
+      }
+      
+      // If no flights found from tools, use mock data
+      if (flights.length === 0) {
+        console.log('No flights found from tools, using mock data');
+        const mockResponse = await this.getMockFlightData({
+          destination: searchParams.destination,
+          startDate: new Date(searchParams.departureDate),
+          endDate: new Date(searchParams.returnDate),
+          preferences: { origin: searchParams.origin }
+        } as any);
+        return mockResponse.data;
+      }
+      
+      const flightInfo: FlightSearchResults = {
+        origin: searchParams.origin,
+        destination: searchParams.destination,
+        departureDate: searchParams.departureDate,
+        returnDate: searchParams.returnDate,
+        passengers: 1,
+        flights: flights,
+        searchSummary: this.extractSummary(agentOutput) || `Found ${flights.length} flight options from ${searchParams.origin} to ${searchParams.destination}`,
+        recommendations: this.extractRecommendations(agentOutput) || [
+          'Compare prices across different airlines',
+          'Book flights 6-8 weeks in advance for best prices',
+          'Consider nearby airports for potentially lower fares',
+          'Check airline baggage policies before booking'
+        ],
+        lastUpdated: new Date().toISOString()
+      };
+
+      return flightInfo;
+    } catch (error) {
+      console.error('Error parsing agent response:', error);
+      throw error;
     }
   }
 
@@ -73,218 +186,6 @@ export class FlightAgent extends BaseAgent {
     // In a real implementation, you might get this from user preferences or location
     // For now, we'll use a default or extract from preferences
     return request.preferences?.origin || 'New York'; // Default origin
-  }
-
-  private async searchFlights(request: TravelPlanRequest): Promise<FlightSearchResults> {
-    try {
-      const origin = this.extractOriginCity(request);
-      const destination = request.destination;
-      
-      // Get airport codes for origin and destination
-      const originCode = await this.getAirportCode(origin);
-      const destinationCode = await this.getAirportCode(destination);
-      
-      if (!originCode || !destinationCode) {
-        console.warn(`Could not find airport codes for ${origin} or ${destination}, using mock data`);
-        // Fall back to mock data if airport codes are not found
-        throw new Error('Airport codes not found');
-      }
-
-      // Search for flights using the API
-      const searchParams = {
-        origin: originCode,
-        destination: destinationCode,
-        departureDate: request.startDate.toISOString().split('T')[0],
-        returnDate: request.endDate.toISOString().split('T')[0],
-        adults: 1,
-        class: 'ECONOMY'
-      };
-
-      const flights = await this.callFlightAPI(searchParams);
-      
-      // If SERP API returns no flights, fall back to mock data
-      if (!flights || flights.length === 0) {
-        console.warn('SERP API returned no flights, falling back to mock data');
-        throw new Error('No flights found from SERP API');
-      }
-      
-      return {
-        origin: origin,
-        destination: destination,
-        departureDate: request.startDate.toISOString().split('T')[0],
-        returnDate: request.endDate.toISOString().split('T')[0],
-        passengers: 1,
-        flights: flights,
-        searchSummary: `Found ${flights.length} flight options from SERP API`,
-        recommendations: [],
-        lastUpdated: new Date().toISOString(),
-      };
-    } catch (error) {
-      console.error('Error searching flights:', error);
-      // Fall back to mock data when SERP API fails
-      throw error;
-    }
-  }
-
-  private async getAirportCode(cityName: string): Promise<string | null> {
-    // Simple airport code mapping - in a real implementation, you'd use an airport API
-    const airportCodes: Record<string, string> = {
-      'new york': 'JFK',
-      'nyc': 'JFK',
-      'london': 'LHR',
-      'paris': 'CDG',
-      'tokyo': 'NRT',
-      'cairo': 'CAI',
-      'dubai': 'DXB',
-      'los angeles': 'LAX',
-      'chicago': 'ORD',
-      'miami': 'MIA',
-      'toronto': 'YYZ',
-      'sydney': 'SYD',
-      'rome': 'FCO',
-      'barcelona': 'BCN',
-      'amsterdam': 'AMS',
-      'frankfurt': 'FRA',
-      'singapore': 'SIN',
-      'hong kong': 'HKG',
-      'bangkok': 'BKK',
-      'istanbul': 'IST'
-    };
-
-    const normalizedCity = cityName.toLowerCase().trim();
-    return airportCodes[normalizedCity] || null;
-  }
-
-  private async callFlightAPI(params: any): Promise<FlightOption[]> {
-    try {
-      // Build search parameters for SERP API (Google Flights)
-      const searchParams = new URLSearchParams({
-        engine: 'google_flights',
-        api_key: this.serpApiKey,
-        departure_id: params.origin,
-        arrival_id: params.destination,
-        outbound_date: params.departureDate,
-        return_date: params.returnDate,
-        currency: 'USD',
-        adults: params.adults?.toString() || '1',
-        type: '1' // Round trip
-      });
-      
-      // Add travel class if specified (SERP API uses different format)
-      const travelClass = params.class?.toLowerCase() || 'economy';
-      if (travelClass === 'economy') {
-        searchParams.append('travel_class', '1');
-      } else if (travelClass === 'premium_economy') {
-        searchParams.append('travel_class', '2');
-      } else if (travelClass === 'business') {
-        searchParams.append('travel_class', '3');
-      } else if (travelClass === 'first') {
-        searchParams.append('travel_class', '4');
-      } else {
-        searchParams.append('travel_class', '1'); // Default to economy
-      }
-
-      console.log('SERP API Request Parameters:', {
-        engine: 'google_flights',
-        departure_id: params.origin,
-        arrival_id: params.destination,
-        outbound_date: params.departureDate,
-        return_date: params.returnDate,
-        currency: 'USD',
-        adults: params.adults?.toString() || '1',
-        travel_class: travelClass === 'economy' ? '1' : travelClass === 'premium_economy' ? '2' : travelClass === 'business' ? '3' : travelClass === 'first' ? '4' : '1',
-        type: '1'
-      });
-      
-      console.log('Full SERP API URL:', `${this.serpApiUrl}?${searchParams}`);
-
-      const response = await fetch(`${this.serpApiUrl}?${searchParams}`, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('SERP API Error Response:', errorText);
-        throw new Error(`SERP API request failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      
-      if (data.error) {
-        console.error('SERP API returned error:', data.error);
-        throw new Error(`SERP API error: ${data.error}`);
-      }
-
-      return this.parseSerpFlightResponse(data);
-    } catch (error) {
-      console.error('SERP API call failed:', error);
-      // Instead of throwing, let's fall back to mock data gracefully
-      return [];
-    }
-  }
-
-  private parseSerpFlightResponse(data: any): FlightOption[] {
-    const flights: FlightOption[] = [];
-    
-    if (!data.best_flights && !data.other_flights) {
-      return flights;
-    }
-
-    // Parse best flights
-    const bestFlights = data.best_flights || [];
-    const otherFlights = data.other_flights || [];
-    const allFlights = [...bestFlights, ...otherFlights];
-
-    allFlights.forEach((flight: any, index: number) => {
-      try {
-        const flightOption: FlightOption = {
-          id: `serp_flight_${index}`,
-          price: {
-            amount: flight.price || 0,
-            currency: 'USD'
-          },
-          outbound: this.parseFlightSegments(flight.flights || []),
-          return: flight.return_flights ? this.parseFlightSegments(flight.return_flights) : [],
-          totalDuration: flight.total_duration || 'N/A',
-          stops: flight.layovers?.length || 0,
-          class: flight.travel_class || 'economy',
-          airline: flight.airline || 'Unknown',
-          baggage: {
-            carry_on: true,
-            checked: flight.baggage || 'Check with airline'
-          }
-        };
-        flights.push(flightOption);
-      } catch (error) {
-        console.warn(`Failed to parse flight ${index}:`, error);
-      }
-    });
-
-    return flights.slice(0, 10); // Return top 10 flights
-  }
-
-  private parseFlightSegments(segments: any[]): FlightSegment[] {
-    return segments.map((segment: any) => ({
-      departure: {
-        airport: segment.departure_airport?.id || 'N/A',
-        city: segment.departure_airport?.name || 'N/A',
-        time: segment.departure_airport?.time || 'N/A',
-        date: segment.departure_airport?.date || 'N/A'
-      },
-      arrival: {
-        airport: segment.arrival_airport?.id || 'N/A',
-        city: segment.arrival_airport?.name || 'N/A',
-        time: segment.arrival_airport?.time || 'N/A',
-        date: segment.arrival_airport?.date || 'N/A'
-      },
-      airline: segment.airline || 'Unknown',
-      flightNumber: segment.flight_number || 'N/A',
-      duration: segment.duration || 'N/A',
-      aircraft: segment.airplane || 'N/A'
-    }));
   }
 
   private getMockFlightData(request: TravelPlanRequest): Promise<AgentResponse> {

@@ -1,18 +1,20 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { AgentResponse } from "./types";
 import { RunnableSequence } from "@langchain/core/runnables";
-import { PromptTemplate } from "@langchain/core/prompts";
+import { PromptTemplate, ChatPromptTemplate } from "@langchain/core/prompts";
 import { StringOutputParser } from "@langchain/core/output_parsers";
 
 export abstract class BaseAgent {
   protected model: ChatOpenAI;
   protected chain!: RunnableSequence;
+  protected prompt?: PromptTemplate | ChatPromptTemplate;
   
   constructor(
     modelName: string = "gpt-4",
     temperature: number = 0.7,
-    protected prompt?: PromptTemplate
+    prompt?: PromptTemplate | ChatPromptTemplate
   ) {
+    this.prompt = prompt;
     if (!process.env.OPENAI_API_KEY) {
       throw new Error('OpenAI API key is not configured');
     }
